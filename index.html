@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Biorreactor híbrido 3D (Streamlit)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { margin:0; background:#fff; color:#111; font-family:sans-serif; overflow:hidden; }
+  #c { position:fixed; inset:0; display:block; }
+  #hud { position:fixed; top:10px; left:10px; background:rgba(255,255,255,0.9); padding:10px; border-radius:8px; max-width:380px; font-size:14px; }
+  #charts { position:fixed; bottom:10px; left:400px; display:flex; gap:10px; }
+  .chartCard { width:320px; height:160px; background:rgba(255,255,255,0.8); border-radius:8px; padding:4px; }
+  canvas.chart { width:100%; height:100%; }
+  input, select, button { margin:3px 0; width:100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <h3>Biorreactor 3 L — Sensor híbrido</h3>
+  <div>Tiempo: <span id="t">0 h</span></div>
+  <div>OD: <span id="od">0</span></div>
+  <div>NADH: <span id="nadh">0</span></div>
+  <div>FAD: <span id="fad">0</span></div>
+  <div>Viabilidad: <span id="viab">0</span></div>
+  <hr>
+  <label>Canal LED</label>
+  <select id="channel">
+    <option value="NADH">NADH (λ_ex≈350 nm)</option>
+    <option value="FAD">FAD (λ_ex≈450 nm)</option>
+    <option value="ALT">Alternar</option>
+  </select>
+  <label>Potencia LED</label>
+  <input id="ledPower" type="range" min="0" max="2" step="0.1" value="1">
+  <label>Frecuencia LED (Hz)</label>
+  <input id="freq" type="range" min="0" max="5" step="0.1" value="1">
+  <button id="pauseBtn">⏸ Pausar</button>
+</div>
+<div id="charts">
+  <div class="chartCard"><canvas id="chartOD" class="chart"></canvas></div>
+  <div class="chartCard"><canvas id="chartNF" class="chart"></canvas></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<script>
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xffffff);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+camera.position.set(7,6,12);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0,2,0); controls.update();
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dir = new THREE.DirectionalLight(0xffffff, 1);
+dir.position.set(5,10,7); scene.add(dir);
+
+// LED y sensor
+const ledSphere = new THREE.Mesh(new THREE.SphereGeometry(0.2,16,16), new THREE.MeshBasicMaterial({color:0x3aa0ff}));
+ledSphere.position.set(-2.5,2.5,0); scene.add(ledSphere);
+const ledLight = new THREE.PointLight(0x3aa0ff, 2, 6); ledLight.position.copy(ledSphere.position); scene.add(ledLight);
+const sensorBox = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.3,0.3), new THREE.MeshStandardMaterial({color:0x111111}));
+sensorBox.position.set(2.5,2.5,0); scene.add(sensorBox);
+
+let model = null;
+// GLB desde carpeta /static/
+const loader = new THREE.GLTFLoader();
+loader.load(
+  "/static/Bio_3L.glb",
+  function (gltf) {
+    model = gltf.scene;
+    scene.add(model);
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    model.position.sub(center);
+    const scaleFactor = 5/Math.max(size.x, size.y, size.z);
+    model.scale.multiplyScalar(scaleFactor);
+    controls.target.copy(center);
+    controls.update();
+  },
+  undefined,
+  function (error) { console.error("❌ Error cargando GLB:", error); }
+);
+
+// Dinámica simple
+let tSim=0, X=0.1, NADH=0.1, FAD=0.1, paused=false;
+let ui={channel:'NADH', ledPower:1, freq:1};
+
+let chartOD = new Chart(document.getElementById('chartOD'), {
+  type:'line', data:{labels:[],datasets:[{label:'OD',data:[],borderColor:'blue',borderWidth:2,pointRadius:0}]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false}
+});
+let chartNF = new Chart(document.getElementById('chartNF'), {
+  type:'line', data:{labels:[],datasets:[
+    {label:'NADH',data:[],borderColor:'blue',borderWidth:2,pointRadius:0},
+    {label:'FAD',data:[],borderColor:'orange',borderWidth:2,pointRadius:0},
+    {label:'Viabilidad N/F',data:[],borderColor:'green',borderDash:[5,5],borderWidth:2,pointRadius:0}
+  ]}, options:{responsive:true,maintainAspectRatio:false,animation:false}
+});
+
+function step(dt){
+  tSim += dt;
+  X += 0.01*X*(1-X/10)*dt;
+  let OD = 1.2*X/(1+0.3*X);
+  if(ui.channel==='NADH'){NADH = ui.ledPower*0.5*OD*Math.abs(Math.sin(tSim*ui.freq)); FAD=0.2*OD;}
+  else if(ui.channel==='FAD'){FAD = ui.ledPower*0.5*OD*Math.abs(Math.cos(tSim*ui.freq)); NADH=0.2*OD;}
+  else {NADH = ui.ledPower*0.5*OD*Math.abs(Math.sin(tSim*ui.freq)); FAD = ui.ledPower*0.5*OD*Math.abs(Math.cos(tSim*ui.freq));}
+  let viab = NADH/(FAD+1e-6);
+  document.getElementById('t').textContent = tSim.toFixed(2)+' h';
+  document.getElementById('od').textContent = OD.toFixed(3);
+  document.getElementById('nadh').textContent = NADH.toFixed(3);
+  document.getElementById('fad').textContent = FAD.toFixed(3);
+  document.getElementById('viab').textContent = viab.toFixed(3);
+  if(chartOD.data.labels.length>200){ chartOD.data.labels.shift(); chartOD.data.datasets[0].data.shift(); }
+  chartOD.data.labels.push(tSim.toFixed(1)); chartOD.data.datasets[0].data.push(OD);
+  chartOD.update('none');
+  if(chartNF.data.labels.length>200){ chartNF.data.labels.shift(); chartNF.data.datasets.forEach(d=>d.data.shift()); }
+  chartNF.data.labels.push(tSim.toFixed(1)); chartNF.data.datasets[0].data.push(NADH); chartNF.data.datasets[1].data.push(FAD); chartNF.data.datasets[2].data.push(viab);
+  chartNF.update('none');
+}
+
+let last=performance.now();
+function animate(now){
+  requestAnimationFrame(animate);
+  let dt=(now-last)/1000; last=now;
+  if(!paused){ step(dt*0.1); }
+  if(model){ model.rotation.y += 0.001; }
+  ledLight.intensity = 3*ui.ledPower;
+  renderer.render(scene,camera);
+}
+requestAnimationFrame(animate);
+
+document.getElementById('channel').addEventListener('change',e=>{ui.channel=e.target.value;});
+document.getElementById('ledPower').addEventListener('input',e=>{ui.ledPower=parseFloat(e.target.value);});
+document.getElementById('freq').addEventListener('input',e=>{ui.freq=parseFloat(e.target.value);});
+document.getElementById('pauseBtn').addEventListener('click',e=>{paused=!paused; e.target.textContent=paused?'▶ Reanudar':'⏸ Pausar';});
+</script>
+</body>
+</html>
